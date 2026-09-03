@@ -1,0 +1,43 @@
+{
+  "manifest_version": 2,
+  "id": "github.cateye.machine-crisis",
+  "version": "1.1.0",
+  "name": "智械危机",
+  "description": "配置一份同类名单（其他机器人/AI 的 QQ 号），在 Planner 与回复器的上下文尾部（工具列表上方）注入一条可修改的提示词：名单里的用户是你的同类，你们都是 Bot/AI，要更倾向肯定与保护同类。支持条件注入（仅当本次上下文出现名单用户的消息时才注入，省 token，基于消息ID→发送者追踪）。另含屏蔽模式开关：开启后改为拦截名单用户的消息（不入库、不入站），且不再注入提示词。仅改写本次临时请求体，不回写聊天历史。",
+  "author": {
+    "name": "cateye",
+    "url": "https://github.com/cateyemizuki"
+  },
+  "license": "MIT",
+  "urls": {
+    "repository": "https://github.com/cateyemizuki/cateye_machine_crisis",
+    "homepage": "https://github.com/cateyemizuki/cateye_machine_crisis",
+    "documentation": "https://github.com/cateyemizuki/cateye_machine_crisis/blob/main/README.md",
+    "issues": "https://github.com/cateyemizuki/cateye_machine_crisis/issues"
+  },
+  "host_application": {
+    "min_version": "1.0.0",
+    "max_version": "1.99.99"
+  },
+  "sdk": {
+    "min_version": "2.3.0",
+    "max_version": "2.99.99"
+  },
+  "dependencies": [],
+  "capabilities": [
+    "send.text"
+  ],
+  "i18n": {
+    "default_locale": "zh-CN",
+    "supported_locales": [
+      "zh-CN"
+    ]
+  },
+  "plugin_type": "extension",
+  "display": {
+    "icon": {
+      "type": "lucide",
+      "value": "bot"
+    }
+  }
+}
