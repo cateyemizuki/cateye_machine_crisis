@@ -48,6 +48,7 @@ from .crisis_core import (
     context_hits_roster,
     extract_group_id,
     extract_user_id,
+    id_matches,
     id_part,
     normalize_roster,
     render_prompt,
@@ -55,7 +56,7 @@ from .crisis_core import (
 )
 
 # 配置版本：与 _manifest.json 的 version 保持同步
-SUPPORTED_CONFIG_VERSION = "1.1.0"
+SUPPORTED_CONFIG_VERSION = "1.2.0"
 
 # ==================== 配置模型 ====================
 
@@ -68,6 +69,14 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件（关闭后不注入、不屏蔽）")
+    admins: list[str] = Field(
+        default_factory=list,
+        description=(
+            "管理员列表：仅这些用户可以执行本插件的管理命令（/智械危机、/同类名单）。"
+            "一行一个 QQ 号（也可填 \"qq:123456\" 形式，比较时只取 ID 部分）。"
+            "留空 = 仅本地操作员（bot 控制台）可执行"
+        ),
+    )
     config_version: str = Field(
         default=SUPPORTED_CONFIG_VERSION,
         description="配置版本（与插件版本同步）",
@@ -183,6 +192,18 @@ class MachineCrisisPlugin(MaiBotPlugin):
     def _roster(self) -> List[str]:
         """规范化后的同类名单。"""
         return normalize_roster(self.config.roster.bot_list)
+
+    def _is_admin(self, user_id: Any, is_local_operator: bool = False) -> bool:
+        """命令鉴权：本地操作员（bot 控制台）放行；否则要求发送者在管理员名单内。
+
+        管理员名单格式兼容纯 ID（``123456``）与平台前缀（``qq:123456``），比较只取 ID 部分。
+        """
+        if is_local_operator:
+            return True
+        uid = str(user_id or "").strip()
+        if not uid:
+            return False
+        return any(id_matches(uid, entry) for entry in self.config.plugin.admins or ())
 
     def _injection_active(self) -> bool:
         """当前是否应注入提示词：插件启用 + 非屏蔽模式 + 有名单。"""
@@ -339,11 +360,30 @@ class MachineCrisisPlugin(MaiBotPlugin):
     @Command(
         "machine_crisis_status",
         description="查看智械危机插件状态：同类名单、注入与屏蔽模式",
-        pattern=r"(?<!\S)/?(?:智械危机|同类名单)\s*$",
+        pattern=r"(?<!\S)/(?:智械危机|同类名单)\s*$",
     )
     async def cmd_status(self, **kwargs: Any) -> tuple[bool, str, bool]:
-        """输出当前名单与运行模式（纯文本回复，仅声明 send.text 能力）。"""
+        """输出当前名单与运行模式（纯文本回复，仅声明 send.text 能力）。
+
+        命令仅限管理员（配置文件 plugin.admins 中的名单）或本地操作员（bot 控制台）使用。
+        """
         stream_id = str(kwargs.get("stream_id") or "")
+        user_id = kwargs.get("user_id")
+        is_local_operator = bool(kwargs.get("is_local_operator"))
+        if not self._is_admin(user_id, is_local_operator):
+            self.ctx.logger.info(
+                "拒绝非管理员执行智械危机命令（user_id=%s local_operator=%s）",
+                id_part(user_id) if user_id else "-",
+                is_local_operator,
+            )
+            try:
+                await self.ctx.send.text(
+                    "权限不足：/智械危机 命令仅管理员可用。请在插件配置的「管理员列表」中添加你的 QQ 号。",
+                    stream_id,
+                )
+            except Exception as e:
+                self.ctx.logger.warning("发送权限不足提示失败：%s", e)
+            return False, "权限不足", True
         lines = self._describe_state()
         try:
             await self.ctx.send.text("\n".join(lines), stream_id)
