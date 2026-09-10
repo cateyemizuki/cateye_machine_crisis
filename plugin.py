@@ -4,14 +4,14 @@
 改写为「你知道名单里这些用户是你的同类」：
 
 1. 同类注入（默认开启）：通过 ``maisaka.planner.before_request`` Hook
-   （BLOCKING + 改 kwargs），把一条注入提示词作为 Context Item 快照追加到
-   ``items`` 列表尾部 —— 即上下文尾部、工具列表上方（工具定义走请求的 tools
-   参数，位于全部上下文条目之后）。提示词告诉 bot：名单里的用户是它的同类，
-   大家都是 Bot/AI，要更倾向肯定与保护同类；模板可在配置中修改，
-   ``{bot_list}`` 占位符会替换为名单文本。
-2. 回复器注入（默认开启）：``maisaka.replyer.before_model_request`` 同样支持
-   改写 ``items``，在回复生成的上下文尾部追加同一条提示词，让「肯定 / 保护
-   同类」落到最终回复文本上。
+   （BLOCKING + 改 kwargs），把一条注入提示词作为 Context Item 快照（默认
+   SystemMessageItem）插入到 ``items`` 列表中**紧随头部系统提示词之后**的位置
+   —— 紧邻宿主 system 指令区、位于全部真实消息之前。提示词告诉 bot：名单里的
+   用户是它的同类，大家都是 Bot/AI，要更倾向肯定与保护同类；模板可在配置中
+   修改，``{bot_list}`` 占位符会替换为名单文本。
+2. 回复器注入（默认关闭）：``maisaka.replyer.before_model_request`` 同样支持
+   改写 ``items``，在回复上下文紧随头部系统提示词之后插入同一条提示词（需在
+   配置中开启 ``inject_into_replyer``），让「肯定 / 保护同类」落到最终回复文本上。
 3. 条件注入（默认关闭，省 token）：开启后插件在入站 Hook 记录
    「消息 ID → 发送者」缓存（宿主发给模型的上下文条目对真实聊天消息带
    ``msg_id`` 前缀），注入前检查本次上下文是否出现名单用户的消息，
@@ -21,9 +21,9 @@
    且**不再注入提示词**；关闭后恢复注入、放行消息。
 
 注入条目的快照格式与宿主 ``serialize_context_item_snapshot`` 对齐
-（UserMessageItem/SystemMessageItem + 唯一 item_id + 文本 part），追加在列表
-尾部不影响既有工具调用/结果的成对校验。只改写本次临时请求体，不回写聊天
-历史、不影响其它模型请求。
+（UserMessageItem/SystemMessageItem + 唯一 item_id + 文本 part），插在头部系统
+提示词之后不触碰既有条目顺序与工具调用/结果的成对校验。只改写本次临时请求体，
+不回写聊天历史、不影响其它模型请求。
 """
 
 from __future__ import annotations
@@ -42,21 +42,21 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder
 
 from .crisis_core import (
     DEFAULT_PROMPT_TEMPLATE,
-    ROLE_USER,
+    ROLE_SYSTEM,
     SenderCache,
-    append_injection,
     context_hits_roster,
     extract_group_id,
     extract_user_id,
     id_matches,
     id_part,
+    insert_injection,
     normalize_roster,
     render_prompt,
     roster_hit,
 )
 
 # 配置版本：与 _manifest.json 的 version 保持同步
-SUPPORTED_CONFIG_VERSION = "1.2.1"
+SUPPORTED_CONFIG_VERSION = "1.2.2"
 
 # ==================== 配置模型 ====================
 
@@ -170,7 +170,7 @@ class InjectSectionConfig(PluginConfigBase):
     inject_into_planner: bool = Field(
         default=True,
         description=(
-            "是否注入 Planner：在 Planner 上下文尾部（工具列表上方）注入同类提示词"
+            "是否注入 Planner：在 Planner 上下文紧随头部系统提示词之后插入同类提示词"
             "（maisaka.planner.before_request）"
         ),
         json_schema_extra={
@@ -179,17 +179,17 @@ class InjectSectionConfig(PluginConfigBase):
             "i18n": _schema_i18n(
                 label_en="Inject into Planner",
                 hint_en=(
-                    "Append the kindred prompt at the tail of the Planner context (above the "
-                    "tool list) (maisaka.planner.before_request)."
+                    "Insert the kindred prompt right after the head system prompt of the "
+                    "Planner context (maisaka.planner.before_request)."
                 ),
             ),
         },
     )
     inject_into_replyer: bool = Field(
-        default=True,
+        default=False,
         description=(
-            "是否注入回复器：在回复器上下文尾部注入同一条提示词"
-            "（maisaka.replyer.before_model_request），让「肯定/保护同类」落到最终回复文本上"
+            "是否注入回复器：在回复器上下文紧随头部系统提示词之后插入同一条提示词"
+            "（maisaka.replyer.before_model_request，默认关闭），让「肯定/保护同类」落到最终回复文本上"
         ),
         json_schema_extra={
             "label": "注入回复器",
@@ -197,9 +197,9 @@ class InjectSectionConfig(PluginConfigBase):
             "i18n": _schema_i18n(
                 label_en="Inject into replyer",
                 hint_en=(
-                    "Append the same prompt at the tail of the replyer context "
-                    "(maisaka.replyer.before_model_request), so that 'affirm/protect kindred' "
-                    "lands on the final reply text."
+                    "Insert the same prompt right after the head system prompt of the replyer "
+                    "context (maisaka.replyer.before_model_request, default: off), so that "
+                    "'affirm/protect kindred' lands on the final reply text."
                 ),
             ),
         },
@@ -227,20 +227,20 @@ class InjectSectionConfig(PluginConfigBase):
         },
     )
     inject_role: Literal["user", "system"] = Field(
-        default=ROLE_USER,
+        default=ROLE_SYSTEM,
         description=(
-            "注入条目的角色：user（与宿主尾部注入的时间/注意事项一致，推荐）"
-            "或 system（部分模型对 system 指令遵循更强）"
+            "注入条目的角色：system（推荐，紧随头部系统提示词、与系统指令区一致，"
+            "模型遵循更强）或 user（作为普通消息条目）"
         ),
         json_schema_extra={
             "label": "注入条目角色",
-            "hint": "注入条目角色",
+            "hint": "注入条目角色（system 或 user）",
             "i18n": _schema_i18n(
                 label_en="Injection role",
                 hint_en=(
-                    "Role of the injected item: user (consistent with the host's tail "
-                    "injection time/notice, recommended) or system (some models follow system "
-                    "instructions more strongly)."
+                    "Role of the injected item: system (recommended; placed right after the "
+                    "head system prompt, consistent with the system instruction block) or user "
+                    "(as a plain message item)."
                 ),
             ),
         },
@@ -374,17 +374,17 @@ class MachineCrisisPlugin(MaiBotPlugin):
         return self._context_hit(kwargs)
 
     def _inject_modified_kwargs(self, kwargs: dict[str, Any]) -> dict[str, Any] | None:
-        """把注入条目追加到 kwargs["items"] 尾部；返回改写后的完整 kwargs 或 None（不注入）。"""
+        """把注入条目插入到 kwargs["items"] 中紧随头部系统提示词之后；返回改写后的完整 kwargs 或 None（不注入）。"""
         items = kwargs.get("items")
         if not isinstance(items, list):
             return None
         prompt_text = self._render_prompt()
-        new_items, appended = append_injection(
+        new_items, inserted = insert_injection(
             items,
             prompt_text,
-            role=str(self.config.inject.inject_role or ROLE_USER),
+            role=str(self.config.inject.inject_role or ROLE_SYSTEM),
         )
-        if not appended:
+        if not inserted:
             return None
         modified = dict(kwargs)
         modified["items"] = new_items
@@ -395,14 +395,14 @@ class MachineCrisisPlugin(MaiBotPlugin):
     @HookHandler(
         "maisaka.planner.before_request",
         name="machine_crisis_planner_inject",
-        description="Planner 请求前把同类提示词追加到上下文尾部（工具列表上方）",
+        description="Planner 请求前把同类提示词插入到头部系统提示词之后",
         mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
         error_policy=ErrorPolicy.SKIP,
         timeout_ms=0,
     )
     async def hook_planner_inject(self, **kwargs: Any) -> dict[str, Any]:
-        """同类注入主入口：追加到 Planner 请求的 items 尾部。"""
+        """同类注入主入口：插入到 Planner 请求 items 的头部系统提示词之后。"""
         try:
             if not self._injection_allowed(kwargs, bool(self.config.inject.inject_into_planner)):
                 return {"action": "continue"}
@@ -410,7 +410,7 @@ class MachineCrisisPlugin(MaiBotPlugin):
             if modified is None:
                 return {"action": "continue"}
             self.ctx.logger.debug(
-                "已在 Planner 上下文尾部注入同类提示词（条目数 %d → %d）",
+                "已在 Planner 上下文头部系统提示词之后注入同类提示词（条目数 %d → %d）",
                 len(kwargs.get("items") or []),
                 len(modified["items"]),
             )
@@ -422,7 +422,7 @@ class MachineCrisisPlugin(MaiBotPlugin):
     @HookHandler(
         "maisaka.replyer.before_model_request",
         name="machine_crisis_replyer_inject",
-        description="回复器请求前把同类提示词追加到上下文尾部（可选，默认关闭）",
+        description="回复器请求前把同类提示词插入到头部系统提示词之后（可选，默认关闭）",
         mode=HookMode.BLOCKING,
         order=HookOrder.LATE,
         error_policy=ErrorPolicy.SKIP,
@@ -436,7 +436,7 @@ class MachineCrisisPlugin(MaiBotPlugin):
             modified = self._inject_modified_kwargs(kwargs)
             if modified is None:
                 return {"action": "continue"}
-            self.ctx.logger.debug("已在回复器上下文尾部注入同类提示词")
+            self.ctx.logger.debug("已在回复器上下文头部系统提示词之后注入同类提示词")
             return {"action": "continue", "modified_kwargs": modified}
         except Exception as e:
             self.ctx.logger.warning("回复器同类注入异常（本次不注入）：%s", e)
