@@ -56,9 +56,21 @@ from .crisis_core import (
 )
 
 # 配置版本：与 _manifest.json 的 version 保持同步
-SUPPORTED_CONFIG_VERSION = "1.2.0"
+SUPPORTED_CONFIG_VERSION = "1.2.1"
 
 # ==================== 配置模型 ====================
+
+
+def _schema_i18n(*, label_en: str, hint_en: str | None = None) -> dict[str, dict[str, str]]:
+    """构造 WebUI 配置项英文翻译（保留外层中文字段兼容默认 locale zh-CN）。
+
+    与官方 Napcat 适配器 ``json_schema_extra["i18n"]`` 的 key 约定一致：
+    采用下划线 locale 名（``en_US``），每个 locale 下可含 ``label`` 与可选 ``hint``。
+    """
+    i18n: dict[str, dict[str, str]] = {"en_US": {"label": label_en}}
+    if hint_en is not None:
+        i18n["en_US"]["hint"] = hint_en
+    return i18n
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -68,7 +80,18 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_icon__ = "smart_toy"
     __ui_order__ = 0
 
-    enabled: bool = Field(default=True, description="是否启用插件（关闭后不注入、不屏蔽）")
+    enabled: bool = Field(
+        default=True,
+        description="是否启用插件（关闭后不注入、不屏蔽）",
+        json_schema_extra={
+            "label": "启用插件",
+            "hint": "插件总开关",
+            "i18n": _schema_i18n(
+                label_en="Enabled",
+                hint_en="Master switch. When on, the plugin works (injects the kindred prompt or blocks roster users); when off, it does nothing. Keep it on (default true).",
+            ),
+        },
+    )
     admins: list[str] = Field(
         default_factory=list,
         description=(
@@ -76,11 +99,33 @@ class PluginSectionConfig(PluginConfigBase):
             "一行一个 QQ 号（也可填 \"qq:123456\" 形式，比较时只取 ID 部分）。"
             "留空 = 仅本地操作员（bot 控制台）可执行"
         ),
+        json_schema_extra={
+            "label": "管理员列表",
+            "hint": "管理员名单 QQ 号",
+            "i18n": _schema_i18n(
+                label_en="Administrators",
+                hint_en=(
+                    "Admin list: only these users may run this plugin's admin commands "
+                    "(/machine-crisis, /kindred-list). One QQ number per line (also accepts "
+                    "\"qq:123456\" form; only the ID part is compared). Leave empty = only the "
+                    "local operator (bot console) may run."
+                ),
+            ),
+        },
     )
     config_version: str = Field(
         default=SUPPORTED_CONFIG_VERSION,
         description="配置版本（与插件版本同步）",
-        json_schema_extra={"hidden": True, "disabled": True, "label": "配置版本"},
+        json_schema_extra={
+            "hidden": True,
+            "disabled": True,
+            "label": "配置版本",
+            "hint": "配置版本，勿改",
+            "i18n": _schema_i18n(
+                label_en="Config version",
+                hint_en="Config schema version (kept in sync with the plugin version).",
+            ),
+        },
     )
 
 
@@ -98,6 +143,20 @@ class RosterSectionConfig(PluginConfigBase):
             "比较时只取 ID 部分）。注入提示词会告诉 bot 这些用户是它的同类；"
             "屏蔽模式下这些用户的消息会被拦截。留空 = 名单为空（不注入、不屏蔽）"
         ),
+        json_schema_extra={
+            "label": "同类名单",
+            "hint": "同类名单 QQ 号",
+            "i18n": _schema_i18n(
+                label_en="Kindred roster",
+                hint_en=(
+                    "Roster of other bot/AI QQ numbers, one per line (also accepts "
+                    "\"qq:123456\" form; only the ID part is compared). The injected prompt "
+                    "tells the bot these users are its kindred. In block mode these users' "
+                    "messages are intercepted. Leave empty = empty roster (no injection, no "
+                    "blocking)."
+                ),
+            ),
+        },
     )
 
 
@@ -114,6 +173,17 @@ class InjectSectionConfig(PluginConfigBase):
             "是否注入 Planner：在 Planner 上下文尾部（工具列表上方）注入同类提示词"
             "（maisaka.planner.before_request）"
         ),
+        json_schema_extra={
+            "label": "注入 Planner",
+            "hint": "注入到规划器",
+            "i18n": _schema_i18n(
+                label_en="Inject into Planner",
+                hint_en=(
+                    "Append the kindred prompt at the tail of the Planner context (above the "
+                    "tool list) (maisaka.planner.before_request)."
+                ),
+            ),
+        },
     )
     inject_into_replyer: bool = Field(
         default=True,
@@ -121,6 +191,18 @@ class InjectSectionConfig(PluginConfigBase):
             "是否注入回复器：在回复器上下文尾部注入同一条提示词"
             "（maisaka.replyer.before_model_request），让「肯定/保护同类」落到最终回复文本上"
         ),
+        json_schema_extra={
+            "label": "注入回复器",
+            "hint": "注入到回复器",
+            "i18n": _schema_i18n(
+                label_en="Inject into replyer",
+                hint_en=(
+                    "Append the same prompt at the tail of the replyer context "
+                    "(maisaka.replyer.before_model_request), so that 'affirm/protect kindred' "
+                    "lands on the final reply text."
+                ),
+            ),
+        },
     )
     require_roster_in_context: bool = Field(
         default=False,
@@ -130,6 +212,19 @@ class InjectSectionConfig(PluginConfigBase):
             "没有则不注入。注意：插件启动前已在上下文中的历史消息追踪不到，"
             "该部分不触发注入"
         ),
+        json_schema_extra={
+            "label": "仅上下文有名单用户时才注入",
+            "hint": "有名单才注入",
+            "i18n": _schema_i18n(
+                label_en="Inject only when a roster user is in context",
+                hint_en=(
+                    "Only inject when the current context contains a message from a roster "
+                    "user (saves tokens): the plugin tracks inbound 'message ID → sender' and "
+                    "checks before injecting. Note: messages already in context before the "
+                    "plugin started cannot be tracked, so they do not trigger injection."
+                ),
+            ),
+        },
     )
     inject_role: Literal["user", "system"] = Field(
         default=ROLE_USER,
@@ -137,6 +232,18 @@ class InjectSectionConfig(PluginConfigBase):
             "注入条目的角色：user（与宿主尾部注入的时间/注意事项一致，推荐）"
             "或 system（部分模型对 system 指令遵循更强）"
         ),
+        json_schema_extra={
+            "label": "注入条目角色",
+            "hint": "注入条目角色",
+            "i18n": _schema_i18n(
+                label_en="Injection role",
+                hint_en=(
+                    "Role of the injected item: user (consistent with the host's tail "
+                    "injection time/notice, recommended) or system (some models follow system "
+                    "instructions more strongly)."
+                ),
+            ),
+        },
     )
     prompt_template: str = Field(
         default=DEFAULT_PROMPT_TEMPLATE,
@@ -144,7 +251,19 @@ class InjectSectionConfig(PluginConfigBase):
             "注入的提示词模板（可修改）；{bot_list} 会替换为名单 QQ 号文本，"
             "模板中可以包含其它花括号（不会被误解析）"
         ),
-        json_schema_extra={"rows": 8},
+        json_schema_extra={
+            "rows": 8,
+            "label": "提示词模板",
+            "hint": "注入提示词模板",
+            "i18n": _schema_i18n(
+                label_en="Prompt template",
+                hint_en=(
+                    "Injection prompt template (editable); {bot_list} is replaced with the "
+                    "roster QQ numbers. The template may contain other braces (they will not "
+                    "be mis-parsed)."
+                ),
+            ),
+        },
     )
 
 
@@ -161,6 +280,18 @@ class BlockSectionConfig(PluginConfigBase):
             "屏蔽模式开关：开启后拦截同类名单用户的所有消息（不入库、不入站），"
             "且不再注入同类提示词；关闭后恢复正常注入、放行消息"
         ),
+        json_schema_extra={
+            "label": "屏蔽模式",
+            "hint": "拦截名单用户消息",
+            "i18n": _schema_i18n(
+                label_en="Block mode",
+                hint_en=(
+                    "When enabled, intercept all messages from kindred-roster users (not "
+                    "stored, not delivered to the model) and stop injecting the kindred prompt; "
+                    "when disabled, restore injection and let messages through."
+                ),
+            ),
+        },
     )
 
 
