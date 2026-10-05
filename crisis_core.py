@@ -8,10 +8,14 @@
 - 构造 Maisaka Context Item 快照格式的注入条目（UserMessageItem / SystemMessageItem），
   插入到请求条目列表中**紧随头部系统提示词（SystemMessageItem 连续段）之后**的位置，
   紧邻宿主 system 指令区、位于全部真实消息之前；
-- 入站消息（``chat.receive.before_process`` 载荷）的用户 ID 提取，供屏蔽模式使用；
-- 「消息 ID → 发送者」缓存（``SenderCache``）与上下文名单命中判断
-  （``context_hits_roster``）：宿主给真实聊天消息的上下文条目带 ``msg_id`` 前缀，
-  注入前反查发送者即可判断「当前上下文是否出现名单用户」，用于省 token 的条件注入。
+- 入站消息（``chat.receive.before_process`` 载荷）的用户 ID / 群号 / 会话标识提取，
+  供屏蔽模式与拦截计数使用；
+- 「(会话, 消息 ID) → 发送者」缓存（``SenderCache``）与上下文名单命中判断
+  （``context_hits_roster``）：宿主给真实聊天消息的上下文条目带 ``msg_id="..."``
+  的 planner 前缀，注入前按（会话, message_id, sender_id）三元组反查发送者，
+  即可判断「当前上下文是否出现名单用户」，用于省 token 的条件注入；
+  普通消息正文中的 msg_id 文本可被用户伪造，不参与命中判定；
+- 屏蔽模式拦截计数（``BlockStats``，按用户 / 按群，可序列化落盘）。
 
 Context Item 快照格式与宿主 ``src/llm_models/request_snapshot.py`` 的
 ``serialize_context_item_snapshot`` 对齐::
@@ -63,17 +67,21 @@ _ITEM_TYPE_BY_ROLE = {
     ROLE_SYSTEM: "SystemMessageItem",
 }
 
-# 上下文文本中提取消息 ID 的两种宿主格式：
-# 1. planner 前缀：<message msg_id="..." time="..." user="...">（src/maisaka/context/planner_messages.py）
-# 2. 说话人可见文本：[msg_id:...]（src/maisaka/context/message_adapter.py format_speaker_content）
+# 上下文文本中提取消息 ID：仅识别宿主 planner 前缀格式
+# <message msg_id="..." time="..." user="...">（src/maisaka/context/planner_messages.py）。
+# 说话人可见文本里的 [msg_id:...] 属于普通消息正文、可被用户粘贴伪造，
+# 不参与命中判定（防伪造触发条件注入）。
+_MSG_TAG_RE = re.compile(r"<message\b[^>]*>")
 _MSG_ID_PLANNER_RE = re.compile(r'\bmsg_id="([^"]*)"')
-_MSG_ID_SPEAKER_RE = re.compile(r"\[msg_id:([^\]]*)\]")
 # planner 前缀的 user 属性（值 = 昵称，昵称缺失时回退为 QQ 号）
 _USER_ATTR_RE = re.compile(r'\buser="([^"]*)"')
 
 # 发送者缓存默认参数
 SENDER_CACHE_MAX_SIZE = 4096
 SENDER_CACHE_TTL_SEC = 24 * 3600.0
+
+# 屏蔽计数按用户 / 按群的键数量上限（防极端场景内存无界）
+BLOCK_STATS_MAX_KEYS = 512
 
 
 # -------------------- 名单 --------------------
@@ -233,7 +241,7 @@ def extract_user_id(message: Any) -> str:
 
 
 def extract_group_id(message: Any) -> str:
-    """从入站消息 Hook 载荷提取群号（仅用于日志）。"""
+    """从入站消息 Hook 载荷提取群号（仅用于日志与拦截计数）。"""
     if not isinstance(message, Mapping):
         return ""
     message_info = message.get("message_info")
@@ -244,16 +252,57 @@ def extract_group_id(message: Any) -> str:
     return ""
 
 
+def extract_user_nickname(message: Any) -> str:
+    """从入站消息 Hook 载荷提取发送者昵称（用于条件注入的属性一致性核对）。"""
+    if not isinstance(message, Mapping):
+        return ""
+    message_info = message.get("message_info")
+    if isinstance(message_info, Mapping):
+        user_info = message_info.get("user_info")
+        if isinstance(user_info, Mapping):
+            return str(user_info.get("user_nickname") or "").strip()
+    return ""
+
+
+def extract_session_id(message: Any) -> str:
+    """从入站消息 Hook 载荷推断会话标识：群聊 ``group:{群号}``，私聊 ``private:{用户ID}``。
+
+    作为「消息 ID → 发送者」缓存的会话维度：同一 message_id 只在所属会话内有效，
+    防止不同会话串号；取不到时返回空串（该消息不进缓存）。
+    """
+    if not isinstance(message, Mapping):
+        return ""
+    message_info = message.get("message_info")
+    if not isinstance(message_info, Mapping):
+        return ""
+    group_info = message_info.get("group_info")
+    if isinstance(group_info, Mapping):
+        gid = str(group_info.get("group_id") or "").strip()
+        if gid:
+            return f"group:{gid}"
+    user_info = message_info.get("user_info")
+    if isinstance(user_info, Mapping):
+        uid = str(user_info.get("user_id") or "").strip()
+        if uid:
+            return f"private:{uid}"
+    return ""
+
+
 # -------------------- 消息 ID → 发送者缓存 --------------------
 
 
 class SenderCache:
-    """入站消息的 ``message_id → user_id`` 缓存（TTL + 容量上限）。
+    """入站消息的「(会话, message_id) → (sender_id, 昵称)」缓存（TTL + 容量上限）。
 
-    用途：宿主发给模型的上下文条目里，真实聊天消息带 ``msg_id="..."`` 前缀
-    （planner 与 replyer 均同格式），但发送者只显示昵称（昵称缺失才回退 QQ 号）。
-    本插件在入站 Hook 记录「消息 ID → 发送者」，注入前用条目文本里的 msg_id
-    反查发送者，即可判断「当前上下文是否出现名单用户」。
+    用途：宿主发给模型的上下文条目里，真实聊天消息带 ``msg_id="..."`` 的
+    planner 前缀（planner 与 replyer 均同格式），但发送者只显示昵称（昵称缺失
+    才回退 QQ 号）。本插件在入站 Hook 记录每条消息的
+    （会话, message_id, sender_id）三元组，注入前按三元组反查，即可判断
+    「当前上下文是否出现名单用户」。
+
+    三元组匹配的含义：记录只来自真实入站消息，且反查时（会话, message_id）
+    必须与记录完全一致才返回发送者——普通消息正文里粘贴的 msg_id 文本无法
+    凭空捏造记录，不同会话的同号消息也不会串号。
 
     局限：插件启动前已在上下文中的历史消息、或已过缓存 TTL/容量被淘汰的消息
     反查不到，视为非名单用户（表现为不注入，不会误注入）。
@@ -267,35 +316,53 @@ class SenderCache:
     ) -> None:
         self.max_size = max(1, int(max_size))
         self.ttl_sec = max(1.0, float(ttl_sec))
-        # message_id -> (user_id, monotonic 时间)；dict 保持插入序，便于按最旧淘汰
-        self._data: dict[str, tuple[str, float]] = {}
+        # (session_id, message_id) -> (user_id, nickname, monotonic 时间)；
+        # dict 保持插入序，便于按最旧淘汰
+        self._data: dict[tuple[str, str], tuple[str, str, float]] = {}
 
-    def record(self, message_id: Any, user_id: Any, *, now: Optional[float] = None) -> None:
-        """记录一条「消息 ID → 发送者」；ID 为空时忽略。"""
+    def record(
+        self,
+        session_id: Any,
+        message_id: Any,
+        user_id: Any,
+        *,
+        nickname: Any = None,
+        now: Optional[float] = None,
+    ) -> None:
+        """记录一条（会话, 消息 ID, 发送者）三元组；任一为空时忽略。"""
+        sid = str(session_id or "").strip()
         mid = str(message_id or "").strip()
         uid = str(user_id or "").strip()
-        if not mid or not uid:
+        if not sid or not mid or not uid:
             return
         current = time.monotonic() if now is None else float(now)
-        if mid not in self._data and len(self._data) >= self.max_size:
+        key = (sid, mid)
+        if key not in self._data and len(self._data) >= self.max_size:
             oldest = next(iter(self._data))
             self._data.pop(oldest, None)
-        self._data[mid] = (uid, current)
+        self._data[key] = (uid, str(nickname or "").strip(), current)
 
-    def get_sender(self, message_id: Any, *, now: Optional[float] = None) -> str:
-        """查询消息发送者；不存在或已过期返回空串（过期项顺带清除）。"""
+    def get_sender(
+        self, session_id: Any, message_id: Any, *, now: Optional[float] = None
+    ) -> Tuple[str, str]:
+        """查询消息发送者，返回 ``(user_id, nickname)``。
+
+        会话或消息 ID 为空、无记录或记录已过期时返回 ``("", "")``
+        （过期项顺带清除）。三元组必须完全匹配：不同会话的同号消息不命中。
+        """
+        sid = str(session_id or "").strip()
         mid = str(message_id or "").strip()
-        if not mid:
-            return ""
-        entry = self._data.get(mid)
+        if not sid or not mid:
+            return ("", "")
+        entry = self._data.get((sid, mid))
         if entry is None:
-            return ""
-        uid, recorded_at = entry
+            return ("", "")
+        uid, nickname, recorded_at = entry
         current = time.monotonic() if now is None else float(now)
         if current - recorded_at > self.ttl_sec:
-            self._data.pop(mid, None)
-            return ""
-        return uid
+            self._data.pop((sid, mid), None)
+            return ("", "")
+        return (uid, nickname)
 
     def clear(self) -> None:
         self._data.clear()
@@ -330,30 +397,54 @@ def _iter_item_texts(items: Iterable[Any]) -> Iterable[str]:
             yield output
 
 
-def extract_msg_ids(text: str) -> set[str]:
-    """从条目文本提取 msg_id（兼容 planner 前缀与说话人格式）。"""
-    found: set[str] = set()
-    for match in _MSG_ID_PLANNER_RE.finditer(text):
-        value = match.group(1).strip()
-        if value:
-            found.add(value)
-    for match in _MSG_ID_SPEAKER_RE.finditer(text):
-        value = match.group(1).strip()
-        if value:
-            found.add(value)
-    return found
+def extract_msg_tags(text: str) -> List[Tuple[str, str]]:
+    """从条目文本提取 planner 消息前缀标签里的 ``(msg_id, user 属性)`` 对。
+
+    仅识别宿主 planner 前缀格式 ``<message msg_id="..." time="..." user="...">``。
+    说话人可见文本里的 ``[msg_id:...]`` 属于普通消息正文、可被用户粘贴伪造，
+    不参与命中判定。
+    """
+    tags: List[Tuple[str, str]] = []
+    for match in _MSG_TAG_RE.finditer(text):
+        tag_text = match.group(0)
+        mid_match = _MSG_ID_PLANNER_RE.search(tag_text)
+        if mid_match is None:
+            continue
+        mid = mid_match.group(1).strip()
+        if not mid:
+            continue
+        user_match = _USER_ATTR_RE.search(tag_text)
+        tags.append((mid, user_match.group(1).strip() if user_match else ""))
+    return tags
 
 
 def context_hits_roster(
     items: Any,
     roster: Sequence[Any],
     cache: Optional[SenderCache] = None,
+    *,
+    session_id: Any = None,
+    allow_attr_match: bool = False,
 ) -> Tuple[bool, str]:
     """判断请求条目列表中是否出现名单用户。
 
-    判定依据（任一命中即算）：
-    1. 条目文本中的 ``msg_id="..."/[msg_id:...]`` 反查发送者缓存，发送者属于名单；
-    2. planner 前缀的 ``user="..."`` 属性值精确等于名单 QQ 号（昵称缺失回退 QQ 号的场景）。
+    判定依据（按优先级）：
+    1. **主判定（三元组反查）**：planner 前缀标签里的 ``msg_id`` 在发送者缓存中
+       按（会话, message_id, sender_id）三元组精确匹配，发送者属于名单即命中。
+       标签里的 ``user`` 属性仅作辅助：与缓存记录的昵称 / ID 明显矛盾时视为
+       伪造前缀，不判定命中；缓存明确记录该消息发送者不在名单时，文本属性
+       也不能推翻缓存。
+    2. **辅助判定（默认关闭）**：``allow_attr_match`` 开启时，planner 前缀的
+       ``user`` 属性值与名单 QQ 号**全等**即命中（昵称缺失回退 QQ 号的场景）。
+       注意 ``user`` 属性值通常是昵称，昵称撞号可能误判，故默认关闭。
+
+    Args:
+        items: Hook 载荷中的 ``items``（Context Item 快照列表）。
+        roster: 同类名单。
+        cache: 发送者缓存（来自入站 Hook 的真实记录）。
+        session_id: 当前请求的会话标识（宿主 planner/replyer 载荷均带
+            ``session_id``）；缺失时三元组反查不可用。
+        allow_attr_match: 是否启用 ``user`` 属性与名单 QQ 号全等的辅助判定。
 
     Returns:
         ``(hit, reason)``：reason 为命中说明（用于日志），未命中为空串。
@@ -364,17 +455,106 @@ def context_hits_roster(
     roster_ids.discard("")
     if not roster_ids:
         return False, ""
+    sid = str(session_id or "").strip()
 
-    seen_msg_ids: set[str] = set()
     for text in _iter_item_texts(items):
-        seen_msg_ids |= extract_msg_ids(text)
-        for value in _USER_ATTR_RE.findall(text):
-            if value.strip() in roster_ids:
-                return True, f"user 属性命中名单（{value.strip()}）"
-
-    if cache is not None and seen_msg_ids:
-        for mid in seen_msg_ids:
-            sender = cache.get_sender(mid)
-            if sender and id_part(sender) in roster_ids:
-                return True, f"消息 {mid} 的发送者在名单中（{id_part(sender)}）"
+        for mid, user_attr in extract_msg_tags(text):
+            sender_id, nickname = ("", "")
+            if cache is not None and sid:
+                sender_id, nickname = cache.get_sender(sid, mid)
+            if sender_id:
+                sender_id_part = id_part(sender_id)
+                if sender_id_part in roster_ids:
+                    # user 属性仅作辅助：与缓存的昵称/ID 明显矛盾 → 疑似伪造，跳过
+                    if (
+                        user_attr
+                        and nickname
+                        and user_attr != nickname
+                        and user_attr != sender_id_part
+                    ):
+                        continue
+                    return True, f"消息 {mid} 的发送者在名单中（{sender_id_part}）"
+                # 缓存明确记录该消息发送者不在名单：文本属性不能推翻缓存
+                continue
+            if allow_attr_match and user_attr and user_attr in roster_ids:
+                return True, f"user 属性精确命中名单 QQ 号（{user_attr}）"
     return False, ""
+
+
+# -------------------- 屏蔽模式拦截计数 --------------------
+
+
+class BlockStats:
+    """屏蔽模式的拦截计数（内存态，按用户 / 按群；可序列化到插件 data_dir）。
+
+    仅计数、不含消息内容；键数量有上限（防极端场景无界增长），超限后新键
+    不再细分（总数照常累计）。
+    """
+
+    def __init__(self, *, max_keys: int = BLOCK_STATS_MAX_KEYS) -> None:
+        self.max_keys = max(1, int(max_keys))
+        self.total = 0
+        self.by_user: dict[str, int] = {}
+        self.by_group: dict[str, int] = {}
+
+    def record(self, user_id: Any, group_id: Any = None) -> None:
+        """累计一次拦截（dry-run 命中也走本入口，便于先观察再启用真拦截）。"""
+        self.total += 1
+        uid = id_part(user_id)
+        if uid:
+            self._bump(self.by_user, uid)
+        gid = id_part(group_id)
+        if gid:
+            self._bump(self.by_group, gid)
+
+    def reset(self) -> None:
+        """清零全部计数。"""
+        self.total = 0
+        self.by_user.clear()
+        self.by_group.clear()
+
+    def top(self, mapping: Mapping[str, int], n: int = 5) -> List[Tuple[str, int]]:
+        """取计数最高的前 n 项（同数次按键名排序，输出稳定）。"""
+        ranked = sorted(mapping.items(), key=lambda kv: (-kv[1], kv[0]))
+        return [(str(k), int(v)) for k, v in ranked[: max(0, int(n))]]
+
+    def to_dict(self) -> dict[str, Any]:
+        """序列化为可 JSON 落盘的 dict。"""
+        return {
+            "total": self.total,
+            "by_user": dict(self.by_user),
+            "by_group": dict(self.by_group),
+        }
+
+    def load_dict(self, data: Any) -> None:
+        """从落盘 dict 恢复计数（容错：结构不符时忽略对应部分）。"""
+        if not isinstance(data, Mapping):
+            return
+        try:
+            self.total = max(0, int(data.get("total") or 0))
+        except (TypeError, ValueError):
+            self.total = 0
+        self.by_user = self._load_counts(data.get("by_user"))
+        self.by_group = self._load_counts(data.get("by_group"))
+
+    def _bump(self, mapping: dict[str, int], key: str) -> None:
+        if key in mapping:
+            mapping[key] += 1
+        elif len(mapping) < self.max_keys:
+            mapping[key] = 1
+
+    def _load_counts(self, raw: Any) -> dict[str, int]:
+        counts: dict[str, int] = {}
+        if not isinstance(raw, Mapping):
+            return counts
+        for key, value in raw.items():
+            key_text = str(key or "").strip()
+            if not key_text:
+                continue
+            try:
+                count = max(0, int(value or 0))
+            except (TypeError, ValueError):
+                continue
+            if count and len(counts) < self.max_keys:
+                counts[key_text] = count
+        return counts
